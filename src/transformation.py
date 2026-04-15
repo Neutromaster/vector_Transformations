@@ -60,6 +60,8 @@ INTENDED USE
 - Parameter inference systems
 """
 
+
+
 # ============================================================
 # INTERNAL CONFIGURATION (HIDDEN PARAMETER SET)
 # ============================================================
@@ -67,7 +69,7 @@ INTENDED USE
 # Discrete set of λ values sampled during dataset generation.
 # These are intentionally hidden from the user — the inference
 # challenge is to recover v without knowing which λ was used.
-_LAMBDA_SET = [0.1, -0.05, 0.05, 0.1, 0.2]
+_LAMBDA_SET = [0.1, -0.05, 0, 0.05, 0.1]
 
 
 # ============================================================

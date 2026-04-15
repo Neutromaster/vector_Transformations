@@ -14,11 +14,16 @@ release = 'v1'
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-xtensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.napoleon',   # for Google/NumPy docstrings
-    'sphinx.ext.viewcode',
+extensions = [  
+'sphinx.ext.autodoc',  
+'sphinx.ext.napoleon', # supports Google/Numpy docstrings  
+'sphinx.ext.mathjax', # renders equations  
+'sphinx.ext.viewcode', # show source code  
+'myst_parser', # markdown support  
+'sphinx_copybutton'  
 ]
+
+
 
 html_theme = 'sphinx_rtd_theme'
 
