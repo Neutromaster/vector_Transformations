@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import csv
 
 # ============================================================
 # MODULE: Nonlinear Causal Rotation-Scaling Transform
@@ -60,17 +61,11 @@ INTENDED USE
 - Parameter inference systems
 """
 
-
-
 # ============================================================
 # INTERNAL CONFIGURATION (HIDDEN PARAMETER SET)
 # ============================================================
 
-# Discrete set of λ values sampled during dataset generation.
-# These are intentionally hidden from the user — the inference
-# challenge is to recover v without knowing which λ was used.
 _LAMBDA_SET = [0.1, -0.05, 0, 0.05, 0.1]
-
 
 # ============================================================
 # TRANSFORM FUNCTION
@@ -98,52 +93,24 @@ def transform(v, lam):
         Transformed vector of same shape as v.
     """
 
-    # Output vector — first pair is always carried over unchanged,
-    # as it serves as the anchor for all downstream computations
     w = v.copy()
-
-    # Total number of 2D coordinate pairs in the input vector
     n_pairs = len(v) // 2
 
-    # ----------------------------------------------------------
-    # ANCHOR EXTRACTION
-    # Extract the first pair (ax, ay) — this is the fixed reference
-    # point that drives the single global rotation and scale
-    # ----------------------------------------------------------
     ax, ay = v[0], v[1]
-
-    # Euclidean magnitude of the anchor pair
-    # Controls the strength of the exponential scaling
     r0 = np.sqrt(ax**2 + ay**2)
 
-    # Rotation angle derived from the anchor's direction
-    # sign(λ) ensures the rotation reverses when λ is negated,
-    # which is the key property that makes the transform invertible
     theta = np.sign(lam) * np.arctan2(ay, ax)
-
-    # Exponential scaling factor — grows/shrinks all pairs uniformly
-    # Using exp ensures s(-λ) = 1/s(λ), giving exact invertibility
     s = np.exp(lam * r0)
 
-    # Precompute rotation matrix components for efficiency
     cos_t, sin_t = np.cos(theta), np.sin(theta)
 
-    # ----------------------------------------------------------
-    # PAIR-WISE TRANSFORMATION
-    # Apply the same R(θ) and s to every non-anchor pair.
-    # ----------------------------------------------------------
     for k in range(1, n_pairs):
-
-        # Extract the k-th input coordinate pair
         x, y = v[2*k], v[2*k + 1]
 
-        # Apply rotation followed by scaling:
-        #   w_k = s · R(θ) · v_k
         w[2*k]     = s * (x * cos_t - y * sin_t)
         w[2*k + 1] = s * (x * sin_t + y * cos_t)
 
     return w
-
 
 # ============================================================
 # DATASET GENERATION
@@ -168,30 +135,18 @@ def generate_dataset(v, n_samples=400):
         Collection of transformed vectors
     """
 
-    # Accumulator for transformed output vectors
     dataset = []
 
     for _ in range(n_samples):
-
-        # Sample a λ uniformly at random from the hidden discrete set.
         lam = np.random.choice(_LAMBDA_SET)
-
-        # Apply the transform and store the result
         w = transform(v, lam)
         dataset.append(w)
 
-    # Stack into a 2D array
     return np.array(dataset)
-
 
 # ============================================================
 # USER INPUT (HIDDEN GROUND TRUTH VIA eval)
 # ============================================================
-
-# Ground truth vector is provided by user.
-# IMPORTANT:
-# - eval() is used as explicitly requested
-# - The vector is NEVER printed or exposed anywhere in output
 
 while True:
     try:
@@ -199,10 +154,8 @@ while True:
             "Enter ground truth vector (e.g. [x0, y0, x1, y1, ...]): "
         )
 
-        # Convert user input into numpy array
         v = np.array(eval(_user_input), dtype=float)
 
-        # Ensure valid structure (pairs of coordinates)
         if len(v) % 2 != 0:
             raise ValueError("Vector length must be even.")
 
@@ -211,31 +164,23 @@ while True:
     except Exception:
         print("Invalid input. Please enter a valid list of numbers.")
 
-
 # ============================================================
 # DATASET GENERATION
 # ============================================================
 
-# Generate the full dataset of transformed outputs
 dataset = generate_dataset(v, n_samples=400)
-
 
 # ============================================================
 # REVERSIBILITY CHECK
 # ============================================================
 
-# Verify that transform(transform(v, λ), -λ) == v
-# WITHOUT printing or exposing v
-
 print("\n--- Reversibility Check ---")
 _all_passed = True
 
 for lam in _LAMBDA_SET:
-
     w = transform(v, lam)
     v_recovered = transform(w, -lam)
 
-    # Only check equality — do NOT print vectors
     passed = np.allclose(v, v_recovered, atol=1e-10)
     print(f"  λ = {lam:+.2f} | Match: {passed}")
 
@@ -244,39 +189,74 @@ for lam in _LAMBDA_SET:
 
 print(f"\nAll λ values reversible: {_all_passed}")
 
-
 # ============================================================
-# SAVE DATASET TO LOCAL PATH
+# SAVE DATASET TO LOCAL PATH (CSV + NPY)
 # ============================================================
 
 _SAVE_DIR = r"C:\Users\DELL\Documents\GitHub\vector_Transformations\data"
 os.makedirs(_SAVE_DIR, exist_ok=True)
 
-_dataset_path      = os.path.join(_SAVE_DIR, "transformed_dataset.npy")
+_csv_path = os.path.join(_SAVE_DIR, "transformed_dataset.csv")
+_npy_path = os.path.join(_SAVE_DIR, "transformed_dataset.npy")
 
-# Save both arrays (ground truth is stored but NOT printed)
-np.save(_dataset_path, dataset)
+# ---- Save CSV ----
+headers = [f"x{i//2}" if i % 2 == 0 else f"y{i//2}" for i in range(len(v))]
 
-print(f"\nDataset saved to:      {_dataset_path}")
+with open(_csv_path, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(headers)
+    writer.writerows(dataset)
 
+print(f"\nDataset saved to CSV: {_csv_path}")
+
+# ---- Save NPY ----
+np.save(_npy_path, dataset)
+
+print(f"Dataset saved to NPY: {_npy_path}")
 
 # ============================================================
 # LOAD DATASET FROM LOCAL PATH
 # ============================================================
 
-dataset_loaded      = np.load(_dataset_path)
+# ---- Load CSV ----
+dataset_csv = []
 
-print("\n--- Loaded Dataset ---")
-print(f"Dataset shape:       {dataset_loaded.shape}")
+with open(_csv_path, mode='r') as file:
+    reader = csv.reader(file)
+    next(reader)
 
-print("\nFirst 5 loaded transformed outputs:")
-print(np.round(dataset_loaded[:5], 3))
+    for row in reader:
+        dataset_csv.append([float(x) for x in row])
 
+dataset_csv = np.array(dataset_csv)
+
+# ---- Load NPY ----
+dataset_npy = np.load(_npy_path)
+
+print("\n--- Loaded Dataset (CSV) ---")
+print(f"Dataset shape: {dataset_csv.shape}")
+
+print("\n--- Loaded Dataset (NPY) ---")
+print(f"Dataset shape: {dataset_npy.shape}")
+
+print("\nFirst 5 loaded transformed outputs (CSV):")
+print(np.round(dataset_csv[:5], 3))
+
+print("\nFirst 5 loaded transformed outputs (NPY):")
+print(np.round(dataset_npy[:5], 3))
+
+# ============================================================
+# CONSISTENCY CHECK
+# ============================================================
+
+print("\n--- Consistency Check (CSV vs NPY) ---")
+same = np.allclose(dataset_csv, dataset_npy)
+print(f"Datasets match: {same}")
 
 # ============================================================
 # DISPLAY FULL DATASET AS LIST
 # ============================================================
 
 print("\n--- Full Transformed Dataset ---")
-for i, sample in enumerate(dataset_loaded):
+for i, sample in enumerate(dataset_npy):
     print(f"  [{i:>3}]: {np.round(sample, 3).tolist()}")
