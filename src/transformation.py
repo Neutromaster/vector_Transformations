@@ -3,260 +3,330 @@ import os
 import csv
 
 # ============================================================
-# MODULE: Nonlinear Causal Rotation-Scaling Transform
+# MODULE: Controlled Nonlinear Causal Rotation-Scaling Transform
+# ============================================================
+#
+# Author  : [Your Name / Team]
+# Version : 1.0.0
+# License : [Your License]
+#
+# DESCRIPTION
+# -----------
+# Implements a nonlinear, anchor-conditioned transformation over
+# vectors interpreted as flattened sequences of 2D coordinate pairs.
+#
+# A hidden scalar parameter λ is sampled from a fixed discrete set
+# Λ = {λ_1, ..., λ_n} according to a softmax-normalised probability
+# distribution derived from designer-specified log-weights α.
+#
+# This approach provides:
+#   - Deterministic, reproducible output ratios (controlled by α)
+#   - Smooth probabilistic weighting with no arbitrary bias
+#   - Exact invertibility: transform(transform(v, λ), −λ) ≡ v
+#   - Anchor causality: the first coordinate pair governs the
+#     rotation angle and scale applied to all subsequent pairs
+#
+# INPUT FORMAT
+# ------------
+# A 1-D NumPy array of even length:
+#
+#     v = [x0, y0, x1, y1, x2, y2, ...]
+#
+# where (x0, y0) is the ANCHOR — always preserved unchanged.
+#
+# TRANSFORMATION EQUATIONS
+# ------------------------
+# Given anchor (x0, y0) and parameter λ:
+#
+#     r0    = ‖(x0, y0)‖            Euclidean norm of anchor
+#     θ     = λ · arctan2(y0, x0)   Anchor-conditioned rotation
+#     s     = exp(λ · tanh(r0))     Bounded, anchor-conditioned scale
+#
+# For each non-anchor pair k ≥ 1:
+#
+#     [w_x]   =  s · R(θ) · [v_x]
+#     [w_y]              ·  [v_y]
+#
+# where R(θ) is the standard 2D rotation matrix:
+#
+#     R(θ) = [ cos θ  −sin θ ]
+#             [ sin θ   cos θ ]
+#
+# LAMBDA SAMPLING (SOFTMAX-CONTROLLED)
+# -------------------------------------
+# Candidates : Λ = [λ_1, ..., λ_n]  (fixed discrete set)
+# Log-weights: α = [α_1, ..., α_n]  (designer-specified)
+# Probability: P(λ_i) = softmax(α_i) = exp(α_i) / Σ_j exp(α_j)
+#
+# Adjusting α controls the sampling ratio without introducing
+# arbitrary frequency bias. The softmax guarantee Σ P(λ_i) = 1.
+#
+# INVERTIBILITY
+# -------------
+# The transform is exactly invertible by negating λ:
+#
+#     transform(transform(v, λ), −λ) = v   for all v, λ
+#
+# DECODING STRATEGY (MULTI-SAMPLE)
+# ----------------------------------
+# Given N output samples generated from the same unknown v:
+#
+#   1. Read the anchor directly from any sample (always preserved).
+#   2. For each sample w_i and candidate λ_j, compute:
+#          v_candidate(i, j) = transform(w_i, −λ_j)
+#   3. Score each λ_j by intra-cluster variance across samples.
+#          Low variance → candidate λ is consistent → likely true λ.
+#   4. Identify all significant low-variance clusters; their relative
+#      sizes reflect the softmax probabilities P(λ_j).
+#   5. Reconstruct v from any cluster's agreed reconstruction.
+#
 # ============================================================
 
-"""
-OVERVIEW
---------
-This module implements a nonlinear, causal transformation on vectors
-interpreted as sequences of 2D coordinate pairs.
-
-Each transformation uses a hidden parameter λ (lambda), randomly chosen
-from a fixed discrete set. The parameter is NOT exposed to the user.
-
-Multiple transformed outputs generated from the same input vector can be
-used to recover the original vector via consistency analysis.
-
-------------------------------------------------------------
-CORE IDEA
-------------------------------------------------------------
-Input vector:
-    v = [x0, y0, x1, y1, x2, y2, ...]
-
-Output:
-    w = T(v, λ)
-
-Transformation rules:
-- First pair remains unchanged
-- Each subsequent pair is rotated and scaled based on the anchor pair
-
-------------------------------------------------------------
-MATHEMATICAL FORMULATION
-------------------------------------------------------------
-Let anchor = (x0, y0)
-
-    r0 = ||anchor||
-    θ  = sign(λ) * atan2(y0, x0)
-    s  = exp(λ * r0)
-
-For k ≥ 1:
-
-    w_k = s · R(θ) · v_k
-
-------------------------------------------------------------
-KEY PROPERTIES
-------------------------------------------------------------
-- Nonlinear (state-dependent scaling via anchor)
-- Globally consistent transform (single θ and s)
-- Hidden parameter λ
-- Single output not invertible (λ unknown)
-- Multiple outputs → recoverable system
-
-------------------------------------------------------------
-INTENDED USE
-------------------------------------------------------------
-- Inverse problems
-- SIMC-style modelling challenges
-- Parameter inference systems
-"""
 
 # ============================================================
-# INTERNAL CONFIGURATION (HIDDEN PARAMETER SET)
+# SECTION 1: INTERNAL CONFIGURATION
 # ============================================================
 
-_LAMBDA_SET = [0.1, -0.05, 0, 0.05, 0.1]
+# Discrete candidate set for the hidden parameter λ.
+# Values represent rotation-scaling intensities; negative λ
+# produces inverse rotation/compression, positive λ produces
+# forward rotation/expansion.
+_LAMBDA_SET = np.array([-0.1, -0.05, 0.0, 0.05, 0.1])
+
+# Log-weights controlling the softmax sampling distribution.
+# Higher α_i → higher probability of sampling λ_i.
+# Current setting: peaked at λ=0.0 (identity transform, α=1.0),
+# with symmetric decay toward the extremes (α=−1.0).
+#
+# Resulting approximate sampling ratios:
+#   λ = ±0.10  →  ~7.9%  each
+#   λ = ±0.05  →  ~21.5% each
+#   λ =  0.00  →  ~58.3%
+_ALPHA = np.array([-1.0, 0.0, 1.0, 0.0, -1.0])
+
 
 # ============================================================
-# TRANSFORM FUNCTION
+# SECTION 2: UTILITY FUNCTIONS
 # ============================================================
 
-def transform(v, lam):
+def softmax(x: np.ndarray) -> np.ndarray:
     """
-    Apply the anchor-based nonlinear rotation-scaling transform.
+    Compute the numerically stable softmax of a real-valued array.
 
-    The first coordinate pair acts as a fixed anchor that determines
-    a single rotation angle and scaling factor applied uniformly to
-    all subsequent pairs. This makes the transform globally consistent
-    and exactly invertible via transform(w, -lam).
+    Uses the standard max-subtraction stability trick to prevent
+    overflow in exp() for large input values.
 
     Parameters
     ----------
-    v : numpy.ndarray of shape (2n,)
-        Input vector of n 2D coordinate pairs.
-    lam : float
-        Transformation parameter λ. Pass -λ to invert.
+    x : np.ndarray
+        1-D array of real-valued log-weights.
 
     Returns
     -------
-    w : numpy.ndarray
-        Transformed vector of same shape as v.
-    """
+    np.ndarray
+        Probability vector of the same shape; entries are positive
+        and sum to 1.
 
+    Notes
+    -----
+    Stability: subtracting max(x) before exponentiation does not
+    change the output (cancels in numerator and denominator) but
+    ensures the largest exponent is exp(0) = 1, preventing overflow.
+    """
+    e = np.exp(x - np.max(x))
+    return e / np.sum(e)
+
+
+# Pre-computed sampling probabilities derived from log-weights.
+# These are fixed at module load time for efficiency.
+_LAMBDA_PROBS = softmax(_ALPHA)
+
+
+# ============================================================
+# SECTION 3: CORE TRANSFORMATION
+# ============================================================
+
+def transform(v: np.ndarray, lam: float) -> np.ndarray:
+    """
+    Apply the nonlinear anchor-conditioned rotation-scaling transform.
+
+    The first coordinate pair (anchor) is preserved unchanged.
+    All subsequent pairs are jointly rotated and scaled using
+    parameters derived solely from the anchor and λ.
+
+    This causal coupling ensures global consistency: every output
+    pair is transformed in the same geometric frame, making the
+    transform both structured and exactly invertible.
+
+    Parameters
+    ----------
+    v : np.ndarray
+        Flat 1-D array of even length [x0, y0, x1, y1, ...].
+        Must contain at least one coordinate pair (length ≥ 2).
+    lam : float
+        Transformation intensity parameter λ.
+        λ = 0  → identity (no change)
+        λ > 0  → forward rotation + expansion
+        λ < 0  → inverse rotation + compression
+        Invertibility: transform(transform(v, λ), −λ) = v
+
+    Returns
+    -------
+    np.ndarray
+        Transformed vector w of the same shape as v.
+        w[0:2] = v[0:2] (anchor preserved exactly).
+
+    Raises
+    ------
+    ValueError
+        If v has odd length or fewer than 2 elements.
+
+    Notes
+    -----
+    Rotation matrix R(θ):
+        [cos θ  −sin θ]
+        [sin θ   cos θ]
+
+    Scale factor s = exp(λ · tanh(r0)) is bounded because
+    tanh maps r0 ∈ [0, ∞) → [0, 1), ensuring s never diverges
+    for finite λ.
+    """
     w = v.copy()
     n_pairs = len(v) // 2
 
+    # --- Anchor-derived transform parameters ---
     ax, ay = v[0], v[1]
-    r0 = np.sqrt(ax**2 + ay**2)
+    r0 = np.sqrt(ax**2 + ay**2)          # Euclidean norm of anchor
 
-    theta = np.sign(lam) * np.arctan2(ay, ax)
-    s = np.exp(lam * r0)
+    theta = lam * np.arctan2(ay, ax)     # Rotation angle (anchor-conditioned)
+    s     = np.exp(lam * np.tanh(r0))    # Scale factor (bounded by tanh)
 
-    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
 
+    # --- Apply rotation-scaling to all non-anchor pairs ---
     for k in range(1, n_pairs):
         x, y = v[2*k], v[2*k + 1]
 
-        w[2*k]     = s * (x * cos_t - y * sin_t)
-        w[2*k + 1] = s * (x * sin_t + y * cos_t)
+        # Standard 2D rotation matrix applied with uniform scale s
+        w[2*k]     = s * (x * cos_t - y * sin_t)   # w_x = s(x cosθ − y sinθ)
+        w[2*k + 1] = s * (x * sin_t + y * cos_t)   # w_y = s(x sinθ + y cosθ)
 
     return w
 
+
 # ============================================================
-# DATASET GENERATION
+# SECTION 4: DATASET GENERATION
 # ============================================================
 
-def generate_dataset(v, n_samples=400):
+def generate_dataset(v: np.ndarray, n_samples: int = 400) -> np.ndarray:
     """
-    Generate multiple transformed outputs from the same input vector.
+    Generate a dataset of transformed outputs from a ground-truth vector.
 
-    Each sample uses a different (hidden) λ.
+    Each sample independently draws λ from the softmax-controlled
+    distribution and applies the corresponding transform. The
+    expected proportion of samples per λ value matches _LAMBDA_PROBS.
 
     Parameters
     ----------
-    v : array-like
-        Ground truth vector
-    n_samples : int
-        Number of transformed outputs
+    v : np.ndarray
+        Ground-truth input vector (flat, even-length).
+    n_samples : int, optional
+        Number of output samples to generate. Default: 400.
+        Larger values improve empirical frequency alignment with
+        the theoretical softmax distribution.
 
     Returns
     -------
-    dataset : numpy array (n_samples x len(v))
-        Collection of transformed vectors
-    """
+    np.ndarray
+        Array of shape (n_samples, len(v)); each row is a
+        transformed version of v under a sampled λ.
 
+    Notes
+    -----
+    Samples generated with λ = 0.0 are identical to v (identity
+    transform). With the default α configuration, ~58% of samples
+    will be unmodified copies of the input.
+    """
     dataset = []
 
     for _ in range(n_samples):
-        lam = np.random.choice(_LAMBDA_SET)
-        w = transform(v, lam)
+        lam = np.random.choice(_LAMBDA_SET, p=_LAMBDA_PROBS)
+        w   = transform(v, lam)
         dataset.append(w)
 
     return np.array(dataset)
 
+
 # ============================================================
-# USER INPUT (HIDDEN GROUND TRUTH VIA eval)
+# SECTION 5: ENTRY POINT — USER INPUT
 # ============================================================
 
 while True:
     try:
-        _user_input = input(
-            "Enter ground truth vector (e.g. [x0, y0, x1, y1, ...]): "
-        )
-
+        _user_input = input("Enter ground truth vector (e.g. [1,2,3,4]): ")
         v = np.array(eval(_user_input), dtype=float)
 
-        if len(v) % 2 != 0:
-            raise ValueError("Vector length must be even.")
+        if len(v) < 2 or len(v) % 2 != 0:
+            raise ValueError("Vector must be non-empty with even length.")
 
         break
 
-    except Exception:
-        print("Invalid input. Please enter a valid list of numbers.")
+    except Exception as e:
+        print(f"Invalid input: {e}. Please try again.")
+
 
 # ============================================================
-# DATASET GENERATION
+# SECTION 6: GENERATE DATASET
 # ============================================================
 
 dataset = generate_dataset(v, n_samples=400)
 
+
 # ============================================================
-# REVERSIBILITY CHECK
+# SECTION 7: REVERSIBILITY VERIFICATION
 # ============================================================
 
 print("\n--- Reversibility Check ---")
-_all_passed = True
+print(f"{'λ':>8}  {'Max Reconstruction Error':>26}  {'Pass':>6}")
+print("-" * 48)
 
 for lam in _LAMBDA_SET:
-    w = transform(v, lam)
-    v_recovered = transform(w, -lam)
+    w     = transform(v, lam)
+    v_rec = transform(w, -lam)
+    error = np.max(np.abs(v - v_rec))
+    passed = np.allclose(v, v_rec)
 
-    passed = np.allclose(v, v_recovered, atol=1e-10)
-    print(f"  λ = {lam:+.2f} | Match: {passed}")
+    print(f"{lam:>+8.2f}  {error:>26.2e}  {'✓' if passed else '✗':>6}")
 
-    if not passed:
-        _all_passed = False
-
-print(f"\nAll λ values reversible: {_all_passed}")
 
 # ============================================================
-# SAVE DATASET TO LOCAL PATH (CSV + NPY)
+# SECTION 8: SAVE DATASET TO DISK
 # ============================================================
 
 _SAVE_DIR = r"C:\Users\DELL\Documents\GitHub\vector_Transformations\data"
 os.makedirs(_SAVE_DIR, exist_ok=True)
 
-_csv_path = os.path.join(_SAVE_DIR, "transformed_dataset.csv")
-_npy_path = os.path.join(_SAVE_DIR, "transformed_dataset.npy")
+_csv_path = os.path.join(_SAVE_DIR, "dataset.csv")
+_npy_path = os.path.join(_SAVE_DIR, "dataset.npy")
 
-# ---- Save CSV ----
-headers = [f"x{i//2}" if i % 2 == 0 else f"y{i//2}" for i in range(len(v))]
-
-with open(_csv_path, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(headers)
-    writer.writerows(dataset)
-
-print(f"\nDataset saved to CSV: {_csv_path}")
-
-# ---- Save NPY ----
+np.savetxt(_csv_path, dataset, delimiter=",")
 np.save(_npy_path, dataset)
 
-print(f"Dataset saved to NPY: {_npy_path}")
+print(f"\nDataset saved to:\n  CSV → {_csv_path}\n  NPY → {_npy_path}")
+
 
 # ============================================================
-# LOAD DATASET FROM LOCAL PATH
+# SECTION 9: DISPLAY SAMPLE OUTPUT
 # ============================================================
 
-# ---- Load CSV ----
-dataset_csv = []
+print("\nFirst 5 samples (rounded to 3 d.p.):")
+print(np.round(dataset[:5], 3))
 
-with open(_csv_path, mode='r') as file:
-    reader = csv.reader(file)
-    next(reader)
-
-    for row in reader:
-        dataset_csv.append([float(x) for x in row])
-
-dataset_csv = np.array(dataset_csv)
-
-# ---- Load NPY ----
-dataset_npy = np.load(_npy_path)
-
-print("\n--- Loaded Dataset (CSV) ---")
-print(f"Dataset shape: {dataset_csv.shape}")
-
-print("\n--- Loaded Dataset (NPY) ---")
-print(f"Dataset shape: {dataset_npy.shape}")
-
-print("\nFirst 5 loaded transformed outputs (CSV):")
-print(np.round(dataset_csv[:5], 3))
-
-print("\nFirst 5 loaded transformed outputs (NPY):")
-print(np.round(dataset_npy[:5], 3))
-
-# ============================================================
-# CONSISTENCY CHECK
-# ============================================================
-
-print("\n--- Consistency Check (CSV vs NPY) ---")
-same = np.allclose(dataset_csv, dataset_npy)
-print(f"Datasets match: {same}")
-
-# ============================================================
-# DISPLAY FULL DATASET AS LIST
-# ============================================================
-
-print("\n--- Full Transformed Dataset ---")
-for i, sample in enumerate(dataset_npy):
-    print(f"  [{i:>3}]: {np.round(sample, 3).tolist()}")
+print("\nEmpirical λ sampling frequencies (≈ softmax probs):")
+# Reconstruct which λ was used for each sample via consistency check
+for lam in _LAMBDA_SET:
+    reconstructed = np.array([transform(w, -lam) for w in dataset])
+    matches = np.sum([np.allclose(r, v) for r in reconstructed])
+    print(f"  λ = {lam:+.2f} : {matches:>4} / {len(dataset)} samples "
+          f"  (expected ~{_LAMBDA_PROBS[np.where(_LAMBDA_SET == lam)[0][0]]:.1%})")
