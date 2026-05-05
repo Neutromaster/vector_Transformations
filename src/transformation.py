@@ -1,19 +1,27 @@
 """
 ============================================================
 MODULE: Controlled Nonlinear Causal Rotation-Scaling Transform
-        with Softmax-Weighted Sampling and Gaussian Noise Augmentation
+        with Optional Softmax-Weighted Sampling and
+        Optional Gaussian Noise Augmentation
 ============================================================
 
 Author  : [Your Name / Team]
-Version : 3.0.0
+Version : 4.0.0
 License : [Your License]
 
 OVERVIEW
 --------
 This module implements a nonlinear, anchor-conditioned geometric
 transformation over vectors interpreted as flattened sequences of
-2D coordinate pairs.  It is structured around three clearly separated
-dataset-generation modes, each building on the previous:
+2D coordinate pairs.  It is structured around FOUR clearly separated
+dataset-generation modes that together form a 2 × 2 design matrix:
+
+                        ┌───────────────┬─────────────────────────┐
+                        │   No noise    │   + Bounded Gaussian    │
+    ────────────────────┼───────────────┼─────────────────────────┤
+    Uniform λ sampling  │      raw      │         noisy           │
+    Softmax λ sampling  │   weighted    │     weighted_noisy      │
+    ────────────────────┴───────────────┴─────────────────────────┘
 
     1. generate_dataset_raw(v, n_samples)
        ─────────────────────────────────
@@ -30,10 +38,22 @@ dataset-generation modes, each building on the previous:
 
     3. generate_dataset_noisy(v, n_samples, sigma)
        ─────────────────────────────────────────────
-       Same softmax-weighted sampling as (2), then injects i.i.d.
-       bounded multiplicative Gaussian noise into every non-anchor
-       element.  The anchor pair is kept exact so that downstream
-       decoders can still compute the geometric reference frame.
+       Same UNIFORM λ sampling as (1), then injects i.i.d. bounded
+       multiplicative Gaussian noise into every non-anchor element.
+       Comparing this against (1) isolates the effect of the noise
+       augmentation on a flat λ prior.
+
+    4. generate_dataset_weighted_noisy(v, n_samples, sigma)
+       ─────────────────────────────────────────────────────
+       Same SOFTMAX λ sampling as (2), then injects i.i.d. bounded
+       multiplicative Gaussian noise into every non-anchor element.
+       This is the noise-augmented analogue of (2); comparing it
+       against (3) isolates the effect of the softmax weighting
+       under a noisy regime.
+
+In all four datasets the anchor pair (v[0], v[1]) is preserved
+EXACTLY: noise is only injected into non-anchor elements so that
+downstream decoders can still compute the geometric reference frame.
 
 TRANSFORMATION EQUATIONS
 ------------------------
@@ -60,8 +80,10 @@ Log-weights   : α = [α₁, …, αₙ]   (designer-specified)
 Uniform prob  : P_raw(λᵢ)  = 1/n
 Softmax prob  : P_soft(λᵢ) = exp(αᵢ) / Σⱼ exp(αⱼ)
 
-NOISE MODEL (dataset 3 only)
------------------------------
+Datasets (1) and (3) use P_raw; datasets (2) and (4) use P_soft.
+
+NOISE MODEL (datasets 3 and 4 only)
+-----------------------------------
 Per non-anchor element x:
 
     x_noisy = sign(x) · clamp(|x| · N(1, σ²),  0.95|x|,  1.05|x|)
@@ -76,16 +98,17 @@ INVERTIBILITY
 -------------
     transform(transform(v, λ), −λ) = v   ∀ v, λ
 
-Holds exactly for datasets (1) and (2).  Dataset (3) admits only
-approximate recovery; max element-wise error ≤ 5 % of |x|.
+Holds exactly for datasets (1) and (2).  Datasets (3) and (4) admit
+only approximate recovery; max element-wise error ≤ 5 % of |x|.
 
 OUTPUT FILES
 ------------
-Six files are written to _SAVE_DIR:
+Eight files are written to _SAVE_DIR (4 datasets × 2 formats):
 
-    dataset_raw.csv       / dataset_raw.npy
-    dataset_weighted.csv  / dataset_weighted.npy
-    dataset_noisy.csv     / dataset_noisy.npy
+    dataset_raw.csv               / dataset_raw.npy
+    dataset_weighted.csv          / dataset_weighted.npy
+    dataset_noisy.csv             / dataset_noisy.npy
+    dataset_weighted_noisy.csv    / dataset_weighted_noisy.npy
 ============================================================
 """
 
@@ -387,7 +410,7 @@ def transform(v: np.ndarray, lam: float) -> np.ndarray:
 
 
 # ============================================================
-# SECTION 5: DATASET GENERATION — RAW (UNIFORM SAMPLING)
+# SECTION 5: DATASET GENERATION — RAW (UNIFORM SAMPLING, NO NOISE)
 # ============================================================
 
 def generate_dataset_raw(
@@ -543,7 +566,7 @@ def generate_dataset_weighted(
 
 
 # ============================================================
-# SECTION 7: DATASET GENERATION — NOISY (SOFTMAX + GAUSSIAN NOISE)
+# SECTION 7: DATASET GENERATION — NOISY (UNIFORM SAMPLING + NOISE)
 # ============================================================
 
 def generate_dataset_noisy(
@@ -552,25 +575,27 @@ def generate_dataset_noisy(
     sigma: float   = _SIGMA,
 ) -> np.ndarray:
     """
-    Generate a noisy dataset using softmax-weighted λ sampling plus
-    bounded multiplicative Gaussian white noise on non-anchor elements.
+    Generate a noisy dataset using UNIFORM λ sampling plus bounded
+    multiplicative Gaussian white noise on non-anchor elements.
 
     PURPOSE
     -------
-    Simulates realistic measurement / sensor noise while preserving:
-    1. The anchor pair exactly (required for geometric decoding).
-    2. Signal polarity (noise never flips the sign of a coordinate).
-    3. Approximate magnitude (bounded within ±5 % of original).
-    4. Statistical independence across elements (white noise).
+    This is the noise-augmented analogue of generate_dataset_raw.
+    Like the raw dataset, every λ candidate is drawn with equal
+    probability (no softmax weighting), but each sample is then
+    perturbed with i.i.d. Gaussian noise.  Comparing this dataset
+    against generate_dataset_raw isolates the effect of the noise
+    augmentation under a flat λ prior; comparing it against
+    generate_dataset_weighted_noisy isolates the effect of the
+    softmax weighting under a noisy regime.
 
-    This dataset is intended for training and evaluating noise-robust
-    decoders.  Comparing it against generate_dataset_weighted isolates
-    the effect of the noise augmentation.
+    The anchor pair is preserved exactly so that downstream decoders
+    can still compute the geometric reference frame.
 
     PIPELINE PER SAMPLE
     -------------------
-    Step 1 — λ sampling:
-        λ ~ Categorical(_LAMBDA_SET, _LAMBDA_PROBS)   (softmax distribution)
+    Step 1 — λ sampling (UNIFORM):
+        λ ~ Uniform({λ₁, λ₂, …, λₙ})
 
     Step 2 — Clean transform:
         w = transform(v, λ)
@@ -617,7 +642,7 @@ def generate_dataset_noisy(
     sigma : float, optional
         Standard deviation of the Gaussian multiplier N(1, σ²).
         Default: _SIGMA (module constant = 0.02).
-        · σ → 0    : noise vanishes; dataset approaches weighted dataset.
+        · σ → 0    : noise vanishes; dataset approaches the raw dataset.
         · σ = 0.02 : subtle, realistic noise (±2 % typical deviation).
         · σ → 0.05 : clamp begins to dominate the noise distribution.
         · σ ≫ 0.05 : output approaches Uniform(0.95|x|, 1.05|x|).
@@ -625,7 +650,123 @@ def generate_dataset_noisy(
     Returns
     -------
     np.ndarray, shape (n_samples, len(v))
-        Each row is transform(v, λᵢ) + bounded Gaussian noise on [2:].
+        Each row is transform(v, λᵢ) + bounded Gaussian noise on [2:],
+        with λᵢ drawn uniformly from _LAMBDA_SET.
+        Row layout:
+            row[0:2]   — anchor (exact, identical to clean transform)
+            row[2:]    — noisy non-anchor elements
+
+    Example
+    -------
+    >>> v = np.array([1.0, 2.0, 3.0, 4.0])
+    >>> ds = generate_dataset_noisy(v, n_samples=10, sigma=0.02)
+    >>> ds.shape
+    (10, 4)
+    >>> # Anchor is preserved exactly in every row:
+    >>> assert np.all(ds[:, 0:2] == v[0:2])
+    """
+    dataset = []
+
+    for _ in range(n_samples):
+        # Step 1: UNIFORM λ draw (no probability weights passed).
+        lam = np.random.choice(_LAMBDA_SET)
+
+        # Step 2: apply clean geometric transform.
+        w = transform(v, lam)
+
+        # Step 3: inject i.i.d. Gaussian noise to non-anchor elements.
+        # The anchor (indices 0–1) is deliberately left unperturbed;
+        # see docstring section "WHY ONLY NON-ANCHOR ELEMENTS?" above.
+        w_noisy = w.copy()
+        if len(w) > 2:                              # guard: only if non-anchor elements exist
+            w_noisy[2:] = _apply_noise_to_vector(w[2:], sigma)
+
+        dataset.append(w_noisy)
+
+    return np.array(dataset)
+
+
+# ============================================================
+# SECTION 7b: DATASET GENERATION — WEIGHTED + NOISY (SOFTMAX + NOISE)
+# ============================================================
+
+def generate_dataset_weighted_noisy(
+    v: np.ndarray,
+    n_samples: int = 400,
+    sigma: float   = _SIGMA,
+) -> np.ndarray:
+    """
+    Generate a noisy dataset using SOFTMAX-WEIGHTED λ sampling plus
+    bounded multiplicative Gaussian white noise on non-anchor elements.
+
+    PURPOSE
+    -------
+    This is the noise-augmented analogue of generate_dataset_weighted
+    and the most "production-realistic" of the four datasets: it
+    combines the designer-controlled softmax sampling distribution with
+    the physical-sensor-style bounded noise model.  Use it for training
+    and evaluating noise-robust decoders that must operate under the
+    same λ prior as deployed inference.
+
+    Comparing it against:
+      · generate_dataset_weighted  → isolates the noise effect.
+      · generate_dataset_noisy     → isolates the softmax weighting
+                                      effect under the noisy regime.
+
+    PIPELINE PER SAMPLE
+    -------------------
+    Step 1 — λ sampling (SOFTMAX):
+        λ ~ Categorical(_LAMBDA_SET, _LAMBDA_PROBS)
+        where  _LAMBDA_PROBS = softmax(_ALPHA)
+
+    Step 2 — Clean transform:
+        w = transform(v, λ)
+
+    Step 3 — Noise injection (non-anchor elements only):
+        For each index i ≥ 2:
+            w_noisy[i] = sign(w[i]) · clamp(|w[i]| · N(1, σ²),
+                                             0.95|w[i]|,
+                                             1.05|w[i]|)
+        Anchor elements w[0], w[1] are copied unchanged.
+
+    With the default _ALPHA = [−1, 0, 1, 0, −1], roughly 58 % of
+    samples are drawn with λ = 0; the clean transform output for these
+    samples equals v exactly, but the noise step still perturbs the
+    non-anchor elements.  As a result, even λ = 0 rows in this dataset
+    are noisy copies of v (anchor exact, rest within ±5 %).
+
+    NOISE PROPERTIES
+    ----------------
+    Identical to generate_dataset_noisy (see that docstring for full
+    details).  The only difference between the two functions is the
+    λ sampling distribution.
+
+    INVERTIBILITY
+    -------------
+    Approximate, not exact.  Applying transform(w_noisy, −λ) recovers
+    an approximation v̂ of v with:
+
+        |v̂[i] − v[i]| ≤ 0.05 · |v[i]|   ∀ i ≥ 2
+        v̂[0:2] = v[0:2]   (anchor always exact)
+
+    Averaging the inverse-applied outputs across all samples sharing
+    the same λ reduces residual error proportionally to 1/√N_cluster.
+
+    Parameters
+    ----------
+    v : np.ndarray, shape (2m,),  m ≥ 1
+        Ground-truth input vector (flat, even-length coordinate pairs).
+    n_samples : int, optional
+        Number of noisy output samples.  Default: 400.
+    sigma : float, optional
+        Standard deviation of the Gaussian multiplier N(1, σ²).
+        Default: _SIGMA (module constant = 0.02).
+
+    Returns
+    -------
+    np.ndarray, shape (n_samples, len(v))
+        Each row is transform(v, λᵢ) + bounded Gaussian noise on [2:],
+        with λᵢ drawn from the softmax distribution _LAMBDA_PROBS.
         Row layout:
             row[0:2]   — anchor (exact, identical to clean transform)
             row[2:]    — noisy non-anchor elements
@@ -643,7 +784,7 @@ def generate_dataset_noisy(
     Example
     -------
     >>> v = np.array([1.0, 2.0, 3.0, 4.0])
-    >>> ds = generate_dataset_noisy(v, n_samples=10, sigma=0.02)
+    >>> ds = generate_dataset_weighted_noisy(v, n_samples=10, sigma=0.02)
     >>> ds.shape
     (10, 4)
     >>> # Anchor is preserved exactly in every row:
@@ -652,7 +793,7 @@ def generate_dataset_noisy(
     dataset = []
 
     for _ in range(n_samples):
-        # Step 1: softmax-weighted λ draw.
+        # Step 1: SOFTMAX-weighted λ draw.
         lam = np.random.choice(_LAMBDA_SET, p=_LAMBDA_PROBS)
 
         # Step 2: apply clean geometric transform.
@@ -660,7 +801,8 @@ def generate_dataset_noisy(
 
         # Step 3: inject i.i.d. Gaussian noise to non-anchor elements.
         # The anchor (indices 0–1) is deliberately left unperturbed;
-        # see docstring section "WHY ONLY NON-ANCHOR ELEMENTS?" above.
+        # see docstring section "WHY ONLY NON-ANCHOR ELEMENTS?" in
+        # generate_dataset_noisy above.
         w_noisy = w.copy()
         if len(w) > 2:                              # guard: only if non-anchor elements exist
             w_noisy[2:] = _apply_noise_to_vector(w[2:], sigma)
@@ -718,6 +860,10 @@ def verify_noisy_approximation(v: np.ndarray, sigma: float = _SIGMA) -> None:
     vary between runs.  The key expected observation is that max error
     stays at or below 5 % of the corresponding v element magnitude.
 
+    The same noise model is shared by generate_dataset_noisy and
+    generate_dataset_weighted_noisy (the two differ only in their λ
+    sampling distribution), so this check is representative of both.
+
     Parameters
     ----------
     v : np.ndarray
@@ -774,10 +920,20 @@ def report_lambda_frequencies(
     Returns
     -------
     None  (output is printed to stdout).
+
+    Notes
+    -----
+    The "Expected%" column always shows the softmax probabilities,
+    even for uniformly sampled datasets — this is intentional.  For
+    raw / noisy (uniform) datasets, the relevant baseline is the flat
+    1/|Λ| prior, not the softmax probabilities; the softmax column
+    is shown only for cross-dataset comparison convenience.  The
+    empirical frequencies for uniform datasets should converge to
+    1/|Λ| (= 20 % per λ for |Λ| = 5), not to the softmax column.
     """
     n = len(dataset)
     print(f"\nEmpirical λ frequencies — {label} (n={n}, atol={atol}):")
-    print(f"{'λ':>8}  {'Count':>7}  {'Empirical%':>12}  {'Expected%':>12}")
+    print(f"{'λ':>8}  {'Count':>7}  {'Empirical%':>12}  {'Softmax%':>12}")
     print("-" * 48)
 
     for lam, prob in zip(_LAMBDA_SET, _LAMBDA_PROBS):
@@ -799,7 +955,7 @@ if __name__ == "__main__":
     # 9a. Prompt the user for a ground-truth vector.
     # ----------------------------------------------------------
     print("=" * 60)
-    print("  Nonlinear Causal Rotation-Scaling Transform  v3.0.0")
+    print("  Nonlinear Causal Rotation-Scaling Transform  v4.0.0")
     print("=" * 60)
 
     while True:
@@ -818,16 +974,19 @@ if __name__ == "__main__":
             print(f"  Invalid input: {exc}. Please try again.")
 
     # ----------------------------------------------------------
-    # 9b. Generate all three datasets.
+    # 9b. Generate all four datasets.
     # ----------------------------------------------------------
-    print(f"\n[1/3] Generating RAW dataset      (400 samples, uniform λ)  ...")
+    print(f"\n[1/4] Generating RAW             dataset (400 samples, uniform λ)            ...")
     dataset_raw = generate_dataset_raw(v, n_samples=400)
 
-    print(f"[2/3] Generating WEIGHTED dataset  (400 samples, softmax λ)  ...")
+    print(f"[2/4] Generating WEIGHTED        dataset (400 samples, softmax λ)            ...")
     dataset_weighted = generate_dataset_weighted(v, n_samples=400)
 
-    print(f"[3/3] Generating NOISY dataset     (400 samples, softmax λ, σ={_SIGMA}) ...")
+    print(f"[3/4] Generating NOISY           dataset (400 samples, uniform λ, σ={_SIGMA})  ...")
     dataset_noisy = generate_dataset_noisy(v, n_samples=400, sigma=_SIGMA)
+
+    print(f"[4/4] Generating WEIGHTED+NOISY  dataset (400 samples, softmax λ, σ={_SIGMA})  ...")
+    dataset_weighted_noisy = generate_dataset_weighted_noisy(v, n_samples=400, sigma=_SIGMA)
 
     # ----------------------------------------------------------
     # 9c. Verification checks.
@@ -838,21 +997,24 @@ if __name__ == "__main__":
     # ----------------------------------------------------------
     # 9d. Empirical λ frequency reports for each dataset.
     # ----------------------------------------------------------
-    # Raw dataset: expected uniform ~ 20 % each, but we compare
-    # against softmax probs for reference; the mismatch is intentional.
-    report_lambda_frequencies(dataset_raw,      v, label="RAW      (uniform sample)",   atol=1e-6)
-    report_lambda_frequencies(dataset_weighted, v, label="WEIGHTED (softmax sample)",   atol=1e-6)
-    report_lambda_frequencies(dataset_noisy,    v, label="NOISY    (softmax + noise)",  atol=0.10)
+    # For RAW and NOISY (uniform sampling) the empirical frequencies
+    # should converge to 1/|Λ| = 20 % per λ, NOT to the softmax column.
+    # The "Softmax%" column is shown for cross-dataset comparison only.
+    report_lambda_frequencies(dataset_raw,             v, label="RAW             (uniform sample)",         atol=1e-6)
+    report_lambda_frequencies(dataset_weighted,        v, label="WEIGHTED        (softmax sample)",         atol=1e-6)
+    report_lambda_frequencies(dataset_noisy,           v, label="NOISY           (uniform + noise)",        atol=0.10)
+    report_lambda_frequencies(dataset_weighted_noisy,  v, label="WEIGHTED+NOISY  (softmax + noise)",        atol=0.10)
 
     # ----------------------------------------------------------
-    # 9e. Save all six files (3 datasets × 2 formats each).
+    # 9e. Save all eight files (4 datasets × 2 formats each).
     # ----------------------------------------------------------
     os.makedirs(_SAVE_DIR, exist_ok=True)
 
     _paths = {
-        "raw":      ("dataset_raw.csv",      "dataset_raw.npy",      dataset_raw),
-        "weighted": ("dataset_weighted.csv", "dataset_weighted.npy", dataset_weighted),
-        "noisy":    ("dataset_noisy.csv",    "dataset_noisy.npy",    dataset_noisy),
+        "raw":            ("dataset_raw.csv",            "dataset_raw.npy",            dataset_raw),
+        "weighted":       ("dataset_weighted.csv",       "dataset_weighted.npy",       dataset_weighted),
+        "noisy":          ("dataset_noisy.csv",          "dataset_noisy.npy",          dataset_noisy),
+        "weighted_noisy": ("dataset_weighted_noisy.csv", "dataset_weighted_noisy.npy", dataset_weighted_noisy),
     }
 
     print(f"\n--- Saving datasets to: {_SAVE_DIR} ---")
@@ -861,18 +1023,24 @@ if __name__ == "__main__":
         npy_path = os.path.join(_SAVE_DIR, npy_name)
         np.savetxt(csv_path, ds, delimiter=",")
         np.save(npy_path, ds)
-        print(f"  [{key:>8}]  CSV → {csv_path}")
-        print(f"  [{key:>8}]  NPY → {npy_path}")
+        print(f"  [{key:>14}]  CSV → {csv_path}")
+        print(f"  [{key:>14}]  NPY → {npy_path}")
 
     # ----------------------------------------------------------
     # 9f. Display sample output from each dataset.
     # ----------------------------------------------------------
-    for label, ds in [("RAW", dataset_raw), ("WEIGHTED", dataset_weighted), ("NOISY", dataset_noisy)]:
+    for label, ds in [
+        ("RAW",            dataset_raw),
+        ("WEIGHTED",       dataset_weighted),
+        ("NOISY",          dataset_noisy),
+        ("WEIGHTED+NOISY", dataset_weighted_noisy),
+    ]:
         print(f"\nFirst 5 {label} samples (rounded to 3 d.p.):")
         print(np.round(ds[:5], 3))
 
-    # Element-wise noise delta between first weighted and noisy samples.
+    # Element-wise noise delta between first weighted and weighted+noisy samples.
+    # Both share the same λ sampling distribution, so this isolates the noise effect.
     if len(v) > 2:
-        delta = np.abs(dataset_weighted[0, 2:] - dataset_noisy[0, 2:])
+        delta = np.abs(dataset_weighted[0, 2:] - dataset_weighted_noisy[0, 2:])
         print(f"\nNoise delta on sample-0 non-anchor elements "
-              f"(WEIGHTED vs NOISY):  max={delta.max():.4f}  mean={delta.mean():.4f}")
+              f"(WEIGHTED vs WEIGHTED+NOISY):  max={delta.max():.4f}  mean={delta.mean():.4f}")

@@ -2,14 +2,15 @@
 
 **Source:** `src/transformation.py`
 **Module:** Controlled Nonlinear Causal Rotation–Scaling Transform
-            with Optional Gaussian White Noise Augmentation
-**Version:** 2.0.0
+            with Optional Softmax-Weighted Sampling and
+            Optional Gaussian White Noise Augmentation
+**Version:** 4.0.0
 
 This document is written for someone who has been handed the generated
 datasets and must **recover the hidden ground-truth vector `v`**. It
-explains the transform, the softmax-normalised λ sampling, the new
-Gaussian white noise augmentation, and the properties that make
-inversion (exact or approximate) tractable.
+explains the transform, the optional softmax-normalised λ sampling,
+the optional Gaussian white noise augmentation, and the properties
+that make inversion (exact or approximate) tractable.
 
 ---
 
@@ -26,47 +27,71 @@ interpreted as `n` 2-D coordinate pairs `p_0, p_1, ..., p_{n-1}` where
 `p_k = (x_k, y_k)`.
 
 A hidden scalar parameter **λ**, drawn from a fixed discrete set
-`Λ = _LAMBDA_SET` according to a **softmax-normalised** probability
-distribution over designer-specified log-weights, controls the
-transform. Each call to `generate_dataset` produces many outputs
-`w = T(v, λ_i)` — one for each sampled λ. The solver's job is to
-recover `v` from the collection of `w`s without knowing which λ
-produced each one.
+`Λ = _LAMBDA_SET`, controls the transform. The library exposes
+**four** dataset generators that together form a 2 × 2 design matrix
+crossing two orthogonal choices:
+
+|                          | **No noise**            | **+ Bounded Gaussian**          |
+|--------------------------|-------------------------|---------------------------------|
+| **Uniform λ sampling**   | `generate_dataset_raw`  | `generate_dataset_noisy`        |
+| **Softmax λ sampling**   | `generate_dataset_weighted` | `generate_dataset_weighted_noisy` |
+
+The two orthogonal axes are:
+
+- **Sampling distribution** — uniform over `Λ` vs softmax-weighted by
+  `α = _ALPHA`.
+- **Noise** — clean transform output vs bounded multiplicative
+  Gaussian noise on non-anchor elements.
+
+The solver's job is to recover `v` from the collection of `w`s without
+knowing which λ produced each one.
 
 The design simultaneously achieves:
 
 - **Deterministic, reproducible output ratios** (controlled by `α`)
 - **Smooth probabilistic weighting** with no arbitrary frequency bias
-- **Exact invertibility** (clean transform) — `T(T(v, λ), −λ) ≡ v`
+- **Exact invertibility** (clean transforms) — `T(T(v, λ), −λ) ≡ v`
 - **Anchor causality** — the first coordinate pair governs the
   rotation angle and scale applied to all subsequent pairs
+- **Anchor preservation under noise** — even in the noisy datasets,
+  `w[0:2] == v[0:2]` exactly
 
-### 1.1 Version 2.0 additions
+### 1.1 Output files
 
-Version 2.0 adds **Gaussian white noise augmentation** via a bounded
-multiplicative noise model:
+The script produces **eight** files in total — 4 datasets × 2 formats
+(CSV via `np.savetxt` and binary NumPy via `np.save`):
 
-```
-x_noisy = x · N(1, σ²),  clamped to [0.95·|x|, 1.05·|x|]
-```
+| # | File                          | Format | λ sampling | Noise | Contents                                   |
+|---|-------------------------------|--------|------------|-------|--------------------------------------------|
+| 1 | `dataset_raw.csv`             | CSV    | Uniform    |  No   | Clean transform, flat λ prior              |
+| 2 | `dataset_raw.npy`             | NumPy  | Uniform    |  No   | Clean transform, flat λ prior              |
+| 3 | `dataset_weighted.csv`        | CSV    | Softmax    |  No   | Clean transform, designer-weighted λ       |
+| 4 | `dataset_weighted.npy`        | NumPy  | Softmax    |  No   | Clean transform, designer-weighted λ       |
+| 5 | `dataset_noisy.csv`           | CSV    | Uniform    | Yes   | Transform + Gaussian white noise           |
+| 6 | `dataset_noisy.npy`           | NumPy  | Uniform    | Yes   | Transform + Gaussian white noise           |
+| 7 | `dataset_weighted_noisy.csv`  | CSV    | Softmax    | Yes   | Transform + Gaussian white noise           |
+| 8 | `dataset_weighted_noisy.npy`  | NumPy  | Softmax    | Yes   | Transform + Gaussian white noise           |
 
-This simulates realistic sensor/measurement noise while preserving:
+Invertibility holds **exactly** for clean datasets (1–4) and only
+**approximately** for noisy datasets (5–8); see §6 and §8.
 
-- **Signal polarity** — the sign of each element is never flipped.
-- **Approximate magnitude** — bounded within ±5 % of the original.
-- **Statistical structure** — noise is i.i.d. across elements (white).
+### 1.2 Why four datasets?
 
-The script now produces **four** datasets in total:
+The 2 × 2 design lets you cleanly separate the contributions of the
+sampling distribution from the contributions of the noise:
 
-| # | File                  | Format | Contents                          |
-|---|-----------------------|--------|-----------------------------------|
-| 1 | `dataset_clean.csv`   | CSV    | Original transform, no noise      |
-| 2 | `dataset_clean.npy`   | NumPy  | Original transform, no noise      |
-| 3 | `dataset_noisy.csv`   | CSV    | Transform + Gaussian white noise  |
-| 4 | `dataset_noisy.npy`   | NumPy  | Transform + Gaussian white noise  |
+- **Effect of softmax weighting on a clean signal** — compare
+  `dataset_raw` against `dataset_weighted`.
+- **Effect of softmax weighting on a noisy signal** — compare
+  `dataset_noisy` against `dataset_weighted_noisy`.
+- **Effect of noise under a flat λ prior** — compare `dataset_raw`
+  against `dataset_noisy`.
+- **Effect of noise under a softmax λ prior** — compare
+  `dataset_weighted` against `dataset_weighted_noisy`.
 
-Invertibility holds **exactly** for clean samples and only
-**approximately** for noisy samples (see §6 and §8).
+Each pairwise comparison holds one axis fixed and varies the other,
+which is the canonical setup for ablation studies and noise-robust
+decoder evaluation.
 
 ---
 
@@ -80,11 +105,11 @@ The first pair `p_0 = (x0, y0)` is the **anchor**. It has two roles:
 2. It alone determines the rotation angle and scale factor applied
    to every other pair.
 
-> **Key consequence:** every clean output vector `w` begins with the
-> exact same `(x0, y0)` as the input `v`. The first pair of the hidden
+> **Key consequence:** every output vector `w` begins with the exact
+> same `(x0, y0)` as the input `v`. The first pair of the hidden
 > vector is therefore **not hidden at all** — it is visible in every
-> sample. The anchor is **also kept noise-free in the noisy dataset**
-> (see §4.4) so this property holds across all four output files.
+> sample. The anchor is **also kept noise-free in the noisy datasets**
+> (see §4.4) so this property holds across all eight output files.
 
 ### 2.2 Anchor-derived quantities
 
@@ -137,24 +162,39 @@ sample — it is not pair-specific.
 
 ---
 
-## 3. λ Sampling — Softmax Normalisation
+## 3. λ Sampling — Uniform vs Softmax
 
-λ is not chosen uniformly. It is sampled from a fixed discrete set
-according to a **softmax-normalised** probability distribution
-parameterised by designer-supplied **log-weights** `α`.
+The four datasets pair the same `_LAMBDA_SET` with two different
+sampling distributions. The distribution is the only thing that
+differs between `raw` ↔ `weighted` and between `noisy` ↔
+`weighted_noisy`.
 
 ### 3.1 Definitions
 
 ```
 Λ = _LAMBDA_SET = [-0.10, -0.05, 0.00, 0.05, 0.10]   # 5 candidates
 α = _ALPHA      = [-1.0,  0.0,  1.0,  0.0, -1.0]     # log-weights
-P(λ_i)          = softmax(α_i) = exp(α_i) / Σ_j exp(α_j)
+
+# Uniform (used by raw, noisy):
+P_uniform(λ_i) = 1 / |Λ| = 0.20
+
+# Softmax (used by weighted, weighted_noisy):
+P_softmax(λ_i) = exp(α_i) / Σ_j exp(α_j)
 ```
 
-### 3.2 Why softmax?
+### 3.2 Why offer both?
 
-Softmax converts an unconstrained real-valued log-weight vector `α`
-into a valid probability distribution that automatically satisfies:
+**Uniform** sampling is a flat prior — every λ candidate is equally
+likely. This is the natural baseline / ablation distribution: it
+divorces the dataset's empirical λ frequencies from the designer's
+log-weights, which is useful for benchmarking decoders under no prior
+information about λ.
+
+**Softmax** sampling lets the designer bias the dataset toward
+specific transform intensities by editing `α` — without ad-hoc
+frequency manipulation. Softmax converts an unconstrained
+real-valued log-weight vector `α` into a valid probability
+distribution that automatically satisfies:
 
 - `P(λ_i) > 0` for all i,
 - `Σ_i P(λ_i) = 1`,
@@ -162,11 +202,8 @@ into a valid probability distribution that automatically satisfies:
   of log-weights — adding a constant to every `α_i` leaves the
   distribution unchanged.
 
-The designer therefore specifies the *shape* of the distribution by
-choosing the relative magnitudes of the `α_i`s, not the absolute
-probabilities. To make λ_i twice as likely as λ_j, set
-`α_i = α_j + ln 2`. To make a value very rare, push its `α` strongly
-negative.
+To make `λ_i` twice as likely as `λ_j`, set `α_i = α_j + ln 2`. To
+make a value very rare, push its `α` strongly negative.
 
 ### 3.3 Numerical stability
 
@@ -181,9 +218,19 @@ Subtracting `max(x)` before exponentiation is mathematically a no-op
 largest exponent is `exp(0) = 1`, preventing overflow in `exp` for
 large `α` values.
 
-### 3.4 Resulting distribution under the default α
+### 3.4 Resulting distributions under the default α
 
-With `α = [−1, 0, +1, 0, −1]` the softmax produces:
+Uniform (`raw`, `noisy`):
+
+| λ     | P(λ) |
+|-------|------|
+| −0.10 | 20 % |
+| −0.05 | 20 % |
+|  0.00 | 20 % |
+| +0.05 | 20 % |
+| +0.10 | 20 % |
+
+Softmax (`weighted`, `weighted_noisy`) with `α = [−1, 0, +1, 0, −1]`:
 
 | λ        | α    | P(λ) (≈) |
 |----------|------|----------|
@@ -193,26 +240,33 @@ With `α = [−1, 0, +1, 0, −1]` the softmax produces:
 | +0.05    |  0.0 | ~21.5 %  |
 | +0.10    | −1.0 |  ~7.9 %  |
 
-The distribution is **symmetric about zero** and **peaked at λ = 0**.
-Roughly 58 % of generated samples are *identity* outputs (i.e. exact
-copies of `v` in the clean dataset, or noisy copies of `v` in the
-noisy dataset); the remaining ~42 % spread between mild and strong
-forward/inverse rotation–scaling.
+The softmax distribution is **symmetric about zero** and **peaked at
+λ = 0**. Roughly 58 % of softmax-sampled clean rows are *identity*
+outputs (i.e. exact copies of `v` in the `weighted` dataset, or noisy
+copies of `v` in the `weighted_noisy` dataset). The remaining ~42 %
+spread between mild and strong forward/inverse rotation–scaling.
+
+In the uniform datasets, only ~20 % of rows correspond to λ = 0.
 
 ### 3.5 Implementation
 
 ```python
 _LAMBDA_PROBS = softmax(_ALPHA)             # computed once at import
+
+# Uniform (raw, noisy):
+lam = np.random.choice(_LAMBDA_SET)
+
+# Softmax (weighted, weighted_noisy):
 lam = np.random.choice(_LAMBDA_SET, p=_LAMBDA_PROBS)
 ```
 
 `_LAMBDA_PROBS` is precomputed at module load time for efficiency
-and is reused identically by both `generate_dataset` and
-`generate_dataset_noisy`.
+and is reused identically by `generate_dataset_weighted` and
+`generate_dataset_weighted_noisy`.
 
 ---
 
-## 4. Gaussian White Noise Augmentation (v2.0)
+## 4. Gaussian White Noise Augmentation
 
 ### 4.1 Noise model
 
@@ -239,6 +293,10 @@ The noise is:
 - **Polarity-preserving** — `sign(x_noisy) = sign(x)` is enforced
   explicitly. Noise can never flip the sign of a coordinate.
 
+The same noise model is shared by `generate_dataset_noisy` and
+`generate_dataset_weighted_noisy`. The only difference between the
+two functions is the λ sampling distribution.
+
 ### 4.2 Properties of the σ–clamp interaction
 
 The ±5 % hard clamp is **independent of σ**:
@@ -261,14 +319,14 @@ well-defined scale (`0 · m = 0` for any `m`), so the function returns
 
 ### 4.4 Where noise is applied (and where it isn't)
 
-`apply_noise_to_vector` applies noise to **every** element of the
-input vector it receives — the anchor included. However,
-`generate_dataset_noisy` deliberately **slices off the anchor**
-before calling it:
+`_apply_noise_to_vector` applies noise to **every** element of the
+input vector it receives — the anchor included. However, both
+`generate_dataset_noisy` and `generate_dataset_weighted_noisy`
+deliberately **slice off the anchor** before calling it:
 
 ```python
 w_noisy = w.copy()
-w_noisy[2:] = apply_noise_to_vector(w[2:], sigma)
+w_noisy[2:] = _apply_noise_to_vector(w[2:], sigma)
 ```
 
 so the anchor pair `w[0:2]` is preserved exactly, matching the
@@ -277,9 +335,9 @@ anchor usable as the geometric reference for rotation/scale
 recovery during decoding.
 
 > Whether to noise the anchor or not is a design choice. The library
-> exposes both: call `apply_noise_to_vector` directly to noise
-> everything, or call `generate_dataset_noisy` to noise only
-> non-anchor elements.
+> exposes both: call `_apply_noise_to_vector` directly to noise
+> everything, or call `generate_dataset_noisy` /
+> `generate_dataset_weighted_noisy` to noise only non-anchor elements.
 
 ---
 
@@ -320,36 +378,45 @@ w_noisy ≈ [3, 4, 1.108, 0.101, −0.207, 2.183]
 
 — same anchor, every other element nudged within ±5 %.
 
+This single per-sample pipeline is identical for `dataset_noisy` and
+`dataset_weighted_noisy`; the two datasets differ only in *how* `λ`
+is drawn before this pipeline runs.
+
 ---
 
 ## 6. Key Properties (Useful for Inversion)
 
 1. **Anchor preservation.**
-   `w[0:2] == v[0:2]` for every sample and every λ, in **both** the
-   clean and noisy datasets.
+   `w[0:2] == v[0:2]` for every sample and every λ, in **all four**
+   datasets.
 
-2. **Exact invertibility — clean only.**
+2. **Exact invertibility — clean datasets only (`raw`, `weighted`).**
    Because `s(−λ) = 1/s(λ)` and `θ(−λ) = −θ(λ)`, applying the
    transform again with `−λ` undoes it:
    `transform(transform(v, λ), −λ) == v`
    exactly (up to floating-point noise — the script verifies this in
    §9 of the source with `np.allclose`).
 
-3. **Approximate invertibility — noisy.**
+3. **Approximate invertibility — noisy datasets (`noisy`, `weighted_noisy`).**
    For noisy samples,
    `transform(w_noisy, −λ) ≈ v`
    with per-element error bounded by the ±5 % clamp width.
    The script reports the mean and max reconstruction error per λ
    in §10 of the source.
 
-4. **λ = 0 is the identity (in the clean transform).**
-   If λ = 0 then `s = 1` and `θ = 0`, so `w == v`. With the default
-   softmax-normalised distribution, ~58 % of clean samples are exact
-   copies of `v`. In the noisy dataset, λ = 0 samples are
-   element-wise noisy copies of `v` (anchor still exact).
+4. **λ = 0 is the identity (for the clean transform stage).**
+   If λ = 0 then `s = 1` and `θ = 0`, so the clean transform output
+   is exactly `v`.
+   - In `raw` and `weighted`, this means λ = 0 samples are byte-for-byte
+     copies of `v`.
+   - In `noisy` and `weighted_noisy`, λ = 0 samples are noisy copies
+     of `v` (anchor still exact, non-anchor elements within ±5 %).
+
+   The expected fraction of λ = 0 samples is **20 %** in the uniform
+   datasets and **~58 %** in the softmax datasets.
 
 5. **Finite hidden set.**
-   `_LAMBDA_SET` contains five distinct values. Every sample in the
+   `_LAMBDA_SET` contains five distinct values. Every sample in any
    dataset therefore comes from one of five `(s, θ)` pairs that are
    **fully determined by the anchor** — there is no continuous
    parameter to estimate.
@@ -366,26 +433,29 @@ w_noisy ≈ [3, 4, 1.108, 0.101, −0.207, 2.183]
    For two clean samples `w^{(a)}` and `w^{(b)}` of the same pair
    index `k ≥ 1`:
    `||w_k^{(a)}|| / ||w_k^{(b)}|| == s(λ_a) / s(λ_b)`,
-   independent of `p_k`. In the noisy dataset, the ratio holds in
+   independent of `p_k`. In the noisy datasets, the ratio holds in
    expectation but with a small i.i.d. multiplicative jitter.
 
-8. **Empirical frequencies converge to softmax probabilities.**
+8. **Empirical frequencies converge to the chosen prior.**
    For a dataset of size `N`, the count of samples produced by each
-   λ_i approaches `N · P(λ_i)` as `N → ∞`. Cluster sizes in the
-   recovered λ-labelling are therefore a direct empirical estimate of
-   the softmax distribution. For the noisy dataset, frequency
-   estimation requires a tolerance-based comparison (the script uses
-   `atol=0.1` in §13).
+   λ_i approaches:
+   - `N / |Λ|`           in `raw` and `noisy`            (uniform), and
+   - `N · P_softmax(λ_i)` in `weighted` and `weighted_noisy` (softmax).
+
+   Cluster sizes in the recovered λ-labelling are therefore a direct
+   empirical estimate of whichever prior was used. For the noisy
+   datasets, frequency estimation requires a tolerance-based
+   comparison (the script uses `atol=0.1` in §13).
 
 ---
 
 ## 7. Recovery Strategy
 
-Given a clean dataset of `N` samples `{w^{(i)}}`, a clean path to `v`
-is described in 7.1. Noisy datasets follow the same strategy with the
-adjustments described in 7.2.
+Given a dataset of `N` samples `{w^{(i)}}`, a path to `v` is described
+in 7.1 for the clean datasets. Noisy datasets follow the same strategy
+with the adjustments described in 7.2.
 
-### 7.1 Clean dataset
+### 7.1 Clean datasets (`raw`, `weighted`)
 
 #### Step A — Read the anchor directly.
 
@@ -424,11 +494,12 @@ cluster you can average to suppress floating-point noise.
 #### Shortcut.
 
 Any sample whose non-anchor pairs are **identical** to those of the
-anchor (within tolerance) was generated with λ = 0 and **equals `v`
-directly**. With the default `α` configuration, ~58 % of clean
-samples fall into this category.
+anchor's geometry under λ = 0 (within tolerance) was generated with
+λ = 0 and **equals `v` directly**. Expected fractions:
+- `raw`      — 20 % of samples (uniform prior).
+- `weighted` — ~58 % of samples (softmax prior with default α).
 
-### 7.2 Noisy dataset
+### 7.2 Noisy datasets (`noisy`, `weighted_noisy`)
 
 The same four-step strategy still works, with two modifications:
 
@@ -439,12 +510,12 @@ The same four-step strategy still works, with two modifications:
 2. **Average within clusters.** Because each noisy sample carries
    independent perturbations, averaging the inverse-applied outputs
    inside the same λ-cluster reduces residual error proportionally to
-   `1/√N_cluster`. This is the main reason the noisy dataset still
-   permits accurate recovery: many samples → noise averages out;
+   `1/√N_cluster`. This is the main reason the noisy datasets still
+   permit accurate recovery: many samples → noise averages out;
    the structural transform does not.
 
 The exact-equality shortcut is **not available** for the noisy
-dataset — even λ = 0 samples are perturbed.
+datasets — even λ = 0 samples are perturbed.
 
 ---
 
@@ -463,9 +534,10 @@ and sum to 1. Uses the max-subtraction trick for stability.
 
 ---
 
-### `apply_noise_to_element(x, sigma)`
+### `_apply_noise_to_scalar(x, sigma)`
 
-Apply bounded multiplicative Gaussian white noise to a single scalar.
+*Module-private.* Apply bounded multiplicative Gaussian white noise
+to a single scalar.
 
 | Parameter | Type    | Description                                                 |
 |-----------|---------|-------------------------------------------------------------|
@@ -485,21 +557,22 @@ The ±5 % hard clamp is **independent of σ**.
 
 ---
 
-### `apply_noise_to_vector(vec, sigma)`
+### `_apply_noise_to_vector(vec, sigma)`
 
-Apply independent Gaussian white noise to every element of a vector.
+*Module-private.* Apply independent Gaussian white noise to every
+element of a vector.
 
 | Parameter | Type            | Description                                       |
 |-----------|-----------------|---------------------------------------------------|
 | `vec`     | `numpy.ndarray` | Flat 1-D array. Shape preserved in the output.    |
-| `sigma`   | `float`         | Passed through to `apply_noise_to_element`.       |
+| `sigma`   | `float`         | Passed through to `_apply_noise_to_scalar`.       |
 
 Returns a new `numpy.ndarray` of the same shape as `vec`.
 
 Each element is processed independently — the noise is **i.i.d.**
 across the vector. The function does not exclude the anchor; if you
-want anchor-preservation, slice it off before calling
-(see `generate_dataset_noisy`).
+want anchor-preservation, slice it off before calling (this is how
+both noisy dataset generators use it internally).
 
 ---
 
@@ -524,11 +597,28 @@ Raises `ValueError` if `v` has odd length or fewer than 2 elements.
 
 ---
 
-### `generate_dataset(v, n_samples=400)`
+### `generate_dataset_raw(v, n_samples=400)`
 
-Generate multiple **clean** transformed outputs from the same input
-vector. Each sample independently draws λ from `_LAMBDA_SET` according
-to the **softmax-normalised** distribution `_LAMBDA_PROBS`.
+Generate a **clean** dataset using **uniform** λ sampling. Every
+candidate in `_LAMBDA_SET` is drawn with equal probability `1/|Λ|`,
+independently of `_ALPHA`.
+
+| Parameter   | Type        | Description                                  |
+|-------------|-------------|----------------------------------------------|
+| `v`         | array-like  | Ground truth vector (flat, even-length).     |
+| `n_samples` | `int`       | Number of transformed outputs. Default 400.  |
+
+Returns a `(n_samples, len(v))` NumPy array. Samples are exactly
+invertible. Expected count per λ is `n_samples / |Λ|` (= 80 for
+`n_samples = 400` and `|Λ| = 5`).
+
+---
+
+### `generate_dataset_weighted(v, n_samples=400)`
+
+Generate a **clean** dataset using **softmax-weighted** λ sampling.
+Each sample independently draws λ from `_LAMBDA_SET` according to
+the softmax-normalised distribution `_LAMBDA_PROBS = softmax(_ALPHA)`.
 
 | Parameter   | Type        | Description                                  |
 |-------------|-------------|----------------------------------------------|
@@ -543,10 +633,10 @@ Samples are exactly invertible.
 
 ### `generate_dataset_noisy(v, n_samples=400, sigma=_SIGMA)`
 
-Generate multiple **noisy** transformed outputs. Each sample is
-produced by:
+Generate a **noisy** dataset using **uniform** λ sampling. Each
+sample is produced by:
 
-1. Drawing λ from the softmax-normalised distribution.
+1. Drawing λ uniformly from `_LAMBDA_SET`.
 2. Applying the clean geometric transform.
 3. Injecting i.i.d. multiplicative Gaussian white noise into the
    non-anchor elements (anchor is preserved exactly).
@@ -562,6 +652,67 @@ match the clean transform exactly; all other elements carry bounded
 multiplicative noise. Noisy samples are **not exactly invertible**
 but reconstruct `v` to within the clamp width per element.
 
+This is the noise-augmented analogue of `generate_dataset_raw`.
+
+---
+
+### `generate_dataset_weighted_noisy(v, n_samples=400, sigma=_SIGMA)`
+
+Generate a **noisy** dataset using **softmax-weighted** λ sampling.
+Each sample is produced by:
+
+1. Drawing λ from `_LAMBDA_SET` according to `_LAMBDA_PROBS = softmax(_ALPHA)`.
+2. Applying the clean geometric transform.
+3. Injecting i.i.d. multiplicative Gaussian white noise into the
+   non-anchor elements (anchor is preserved exactly).
+
+| Parameter   | Type        | Description                                                         |
+|-------------|-------------|---------------------------------------------------------------------|
+| `v`         | array-like  | Ground truth vector (flat, even-length).                            |
+| `n_samples` | `int`       | Number of noisy outputs. Default 400.                               |
+| `sigma`     | `float`     | Std-dev of the multiplicative noise. Default `_SIGMA` (= 0.02).     |
+
+Returns a `(n_samples, len(v))` NumPy array with the same anchor /
+noise properties as `generate_dataset_noisy`.
+
+This is the noise-augmented analogue of `generate_dataset_weighted`
+and the most "production-realistic" of the four datasets — it
+combines designer-controlled λ weighting with sensor-style bounded
+noise.
+
+---
+
+### `verify_clean_invertibility(v)`
+
+Print a per-λ table reporting the max element-wise error of
+`transform(transform(v, λ), −λ) − v`, with a ✓/✗ flag from
+`np.allclose`. Useful as a sanity check that the clean transform is
+implemented correctly.
+
+---
+
+### `verify_noisy_approximation(v, sigma=_SIGMA)`
+
+Print a per-λ table reporting the mean and max element-wise error of
+inverse-applying a single noisy sample. Demonstrates that errors stay
+within the ±5 % clamp width. Shared between `noisy` and
+`weighted_noisy` since both use the same noise model.
+
+---
+
+### `report_lambda_frequencies(dataset, v, label, atol=1e-6)`
+
+For each candidate λ, count how many rows of `dataset` are consistent
+with that λ via `transform(w, −λ) ≈ v`. Print empirical percentage
+side-by-side with the softmax probability column.
+
+> **Note.** The "Softmax%" column is shown for *all* datasets,
+> including the uniform ones (`raw`, `noisy`), as a constant
+> cross-dataset reference. For uniform datasets, the empirical
+> frequencies should converge to `1/|Λ|` (= 20 % per λ for `|Λ| = 5`),
+> not to the softmax column. Don't be alarmed by the apparent
+> mismatch in the uniform reports — it is intentional.
+
 ---
 
 ## 9. Module Configuration
@@ -574,11 +725,11 @@ but reconstruct `v` to within the clamp width per element.
 | `_SIGMA`         | `0.02`                             | Default σ for Gaussian noise multiplier.      |
 | `_SAVE_DIR`      | `…/vector_Transformations/data`    | Output directory for dataset files.           |
 
-To change the sampling ratios, edit `_ALPHA`. To change the available
-intensities, edit `_LAMBDA_SET`. The two arrays must have equal length.
-To change the noise strength globally, edit `_SIGMA`; per-call
-overrides are also supported via the `sigma` parameter of
-`generate_dataset_noisy`.
+To change the softmax sampling ratios, edit `_ALPHA`. To change the
+available intensities, edit `_LAMBDA_SET`. The two arrays must have
+equal length. To change the noise strength globally, edit `_SIGMA`;
+per-call overrides are also supported via the `sigma` parameter of
+`generate_dataset_noisy` and `generate_dataset_weighted_noisy`.
 
 ---
 
@@ -588,33 +739,44 @@ Running `python src/transformation.py` executes:
 
 1. **Prompt** the user for a ground-truth vector, parsed with `eval`.
    The vector must be non-empty with even length; it is never echoed.
-2. **Generate the clean dataset** — 400 transformed outputs via
-   `generate_dataset`, sampling λ from the softmax-normalised
+2. **Generate the raw dataset** — 400 transformed outputs via
+   `generate_dataset_raw`, sampling λ uniformly from `_LAMBDA_SET`.
+3. **Generate the weighted dataset** — 400 transformed outputs via
+   `generate_dataset_weighted`, sampling λ from the softmax-normalised
    distribution.
-3. **Generate the noisy dataset** — 400 transformed + noised outputs
-   via `generate_dataset_noisy(σ=_SIGMA)`. Anchor is preserved.
-4. **Reversibility check (clean only)** — for each λ in `_LAMBDA_SET`,
+4. **Generate the noisy dataset** — 400 transformed + noised outputs
+   via `generate_dataset_noisy(σ=_SIGMA)`. λ is sampled uniformly;
+   anchor is preserved.
+5. **Generate the weighted+noisy dataset** — 400 transformed + noised
+   outputs via `generate_dataset_weighted_noisy(σ=_SIGMA)`. λ is
+   softmax-sampled; anchor is preserved.
+6. **Reversibility check (clean only)** — for each λ in `_LAMBDA_SET`,
    confirm that `transform(transform(v, λ), −λ) == v` using
    `np.allclose`. Prints the maximum reconstruction error and a ✓/✗
    flag per λ.
-5. **Approximate reconstruction check (noisy)** — for each λ,
+7. **Approximate reconstruction check (noisy)** — for each λ,
    generate a single noisy sample, invert with `−λ`, and report the
    mean and max element-wise error. Errors are bounded by the ±5 %
    clamp.
-6. **Save four datasets** to:
-   - `…/data/dataset_clean.csv` (CSV via `np.savetxt`)
-   - `…/data/dataset_clean.npy` (binary via `np.save`)
-   - `…/data/dataset_noisy.csv` (CSV via `np.savetxt`)
-   - `…/data/dataset_noisy.npy` (binary via `np.save`)
-7. **Print** the first five rows of each dataset rounded to three
-   decimals, plus a quick noise-magnitude summary
-   (max / mean |clean − noisy|) for sample 0.
-8. **Empirical frequency report** — for each λ, count how many rows
-   reconstruct to `v` under `transform(w, −λ)` and compare the
-   empirical fraction to the theoretical `_LAMBDA_PROBS[i]`.
-   Reported separately for the clean dataset (exact match,
-   `np.allclose`) and the noisy dataset (tolerance match,
-   `np.allclose(..., atol=0.1)`).
+8. **Empirical frequency report** — for each of the four datasets,
+   for each λ, count how many rows reconstruct to `v` under
+   `transform(w, −λ)` and compare the empirical fraction to the
+   softmax reference column. Reported with `atol=1e-6` for clean
+   datasets and `atol=0.1` for noisy datasets.
+9. **Save eight datasets** to:
+   - `…/data/dataset_raw.csv`            (CSV via `np.savetxt`)
+   - `…/data/dataset_raw.npy`            (binary via `np.save`)
+   - `…/data/dataset_weighted.csv`       (CSV via `np.savetxt`)
+   - `…/data/dataset_weighted.npy`       (binary via `np.save`)
+   - `…/data/dataset_noisy.csv`          (CSV via `np.savetxt`)
+   - `…/data/dataset_noisy.npy`          (binary via `np.save`)
+   - `…/data/dataset_weighted_noisy.csv` (CSV via `np.savetxt`)
+   - `…/data/dataset_weighted_noisy.npy` (binary via `np.save`)
+10. **Print** the first five rows of each of the four datasets rounded
+    to three decimals, plus a quick noise-magnitude summary
+    (max / mean |weighted − weighted_noisy|) for sample 0. The
+    weighted vs weighted+noisy comparison holds the λ-sampling
+    distribution fixed and isolates the noise effect.
 
 The ground-truth vector `v` and the per-sample λ are never printed.
 
@@ -623,25 +785,27 @@ The ground-truth vector `v` and the per-sample λ are never printed.
 ## 11. Dependencies
 
 - `numpy`
-- `os`, `csv`, `math`, `random` (Python standard library)
+- `os`, `math`, `random` (Python standard library)
 
-`random.gauss` is used internally by `apply_noise_to_element` for the
-multiplicative noise draw; `numpy.random.choice` is used for
-softmax-weighted λ sampling.
+`random.gauss` is used internally by `_apply_noise_to_scalar` for the
+multiplicative noise draw; `numpy.random.choice` is used for both
+uniform and softmax-weighted λ sampling.
 
 ---
 
 ## 12. Summary Cheat-Sheet
 
-| Quantity            | Formula                              | Known to solver?                      |
-|---------------------|--------------------------------------|---------------------------------------|
-| `(x0, y0)`          | `w[0:2]` of any sample (any dataset) | ✅ directly                           |
-| `r0`                | `sqrt(x0² + y0²)`                    | ✅ derived                            |
-| `θ(λ)`              | `λ · atan2(y0, x0)`                  | ✅ for each λ in `_LAMBDA_SET`        |
-| `s(λ)`              | `exp(λ · tanh(r0))`                  | ✅ for each λ in `_LAMBDA_SET`        |
-| `P(λ)`              | `softmax(α)`                         | ✅ if `α` is published                |
-| `λ` per sample      | not stored                           | ❌ must be inferred                   |
-| `p_k, k ≥ 1` (clean)| `(1/s) · R(−θ) · w_k`                | exact once λ is known                 |
-| `p_k, k ≥ 1` (noisy)| `(1/s) · R(−θ) · w_k`                | approximate; ±5 % per element bound;  |
-|                     |                                      | average over a λ-cluster to denoise   |
-| Noise model         | `x · N(1, σ²)`, clipped to ±5 %·|x|  | ✅ if `σ` is published (default 0.02) |
+| Quantity                  | Formula                              | Known to solver?                      |
+|---------------------------|--------------------------------------|---------------------------------------|
+| `(x0, y0)`                | `w[0:2]` of any sample (any dataset) | ✅ directly                           |
+| `r0`                      | `sqrt(x0² + y0²)`                    | ✅ derived                            |
+| `θ(λ)`                    | `λ · atan2(y0, x0)`                  | ✅ for each λ in `_LAMBDA_SET`        |
+| `s(λ)`                    | `exp(λ · tanh(r0))`                  | ✅ for each λ in `_LAMBDA_SET`        |
+| `P_uniform(λ)`            | `1 / |Λ|`                            | ✅ flat 20 % per λ                    |
+| `P_softmax(λ)`            | `softmax(α)`                         | ✅ if `α` is published                |
+| `λ` per sample            | not stored                           | ❌ must be inferred                   |
+| `p_k, k ≥ 1` (clean)      | `(1/s) · R(−θ) · w_k`                | exact once λ is known                 |
+| `p_k, k ≥ 1` (noisy)      | `(1/s) · R(−θ) · w_k`                | approximate; ±5 % per element bound;  |
+|                           |                                      | average over a λ-cluster to denoise   |
+| Noise model               | `x · N(1, σ²)`, clipped to ±5 %·\|x\| | ✅ if `σ` is published (default 0.02) |
+| Which dataset uses what   | raw / noisy: uniform                 | softmax: weighted / weighted_noisy    |
